@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  transcriber:
+    build: .
+    container_name: audio_transcriber
+    ports:
+      - "8080:8080"
+    volumes:
+      # Зберігаємо кеш моделей на хості, щоб не качати їх щоразу
+      - model_cache:/root/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  model_cache:
