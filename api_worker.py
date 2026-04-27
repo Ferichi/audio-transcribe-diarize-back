@@ -35,10 +35,10 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 models = {"whisper": None, "pyannote": None}
 
 # Vertex AI — зчитуємо з env, щоб не хардкодити
-GCP_PROJECT_ID    = os.getenv("GCP_PROJECT_ID", "")
-GCP_LOCATION      = os.getenv("GCP_LOCATION", "us-central1")
-VERTEX_MODEL      = os.getenv("VERTEX_MODEL_RESOURCE_NAME", "")
-GCS_BUCKET        = os.getenv("GCS_BUCKET", "bucket_audiov1")
+GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "")
+GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1")
+VERTEX_MODEL = os.getenv("VERTEX_MODEL_RESOURCE_NAME", "")
+GCS_BUCKET = os.getenv("GCS_BUCKET", "bucket_audiov1")
 GCS_OUTPUT_PREFIX = os.getenv("GCS_OUTPUT_PREFIX", "gs://bucket_audiov1/batch_results/")
 
 
@@ -86,7 +86,8 @@ async def lifespan(app: FastAPI):
         models["whisper"] = whisper.load_model("medium", device=device)
         log("✅", "Whisper готовий!")
 
-        log("🟢", "СЕРВЕР ГОТОВИЙ. Endpoints: /predict | /rawPredict | /batchPredict | /get-upload-url | /getResult/{job_id}")
+        log("🟢",
+            "СЕРВЕР ГОТОВИЙ. Endpoints: /predict | /rawPredict | /batchPredict | /get-upload-url | /getResult/{job_id}")
         yield
 
     except Exception as e:
@@ -113,7 +114,7 @@ app.add_middleware(
 
 
 # ──────────────────────────────────────────────
-# ДОПОМІЖНІ ФУНКЦІЇ — CLOUD STORAGE
+# ДОПОМІЖНІ ФУНКЦІЇ — CLOUD STORAGE ТА АУДІО
 # ──────────────────────────────────────────────
 
 def download_from_gcs(gcs_path: str) -> str:
@@ -139,15 +140,26 @@ def download_from_gcs(gcs_path: str) -> str:
         raise HTTPException(status_code=500, detail="Failed to download file from Cloud Storage")
 
 
+def get_audio_duration(local_path: str) -> float:
+    """Швидко визначає тривалість аудіо в секундах без завантаження всього файлу в RAM."""
+    try:
+        duration = librosa.get_duration(path=local_path)
+        log("🕒", f"Тривалість файлу: {duration:.2f} сек.")
+        return duration
+    except Exception as e:
+        log("⚠️", f"Не вдалося визначити тривалість: {e}")
+        return 0.0
+
+
 # ──────────────────────────────────────────────
 # ДОПОМІЖНІ ФУНКЦІЇ — VERTEX AI BATCH
 # ──────────────────────────────────────────────
 
 def create_batch_prediction_job(
-    gcs_source_uri: str,
-    language: str,
-    num_speakers: Optional[int],
-    job_display_name: Optional[str] = None,
+        gcs_source_uri: str,
+        language: str,
+        num_speakers: Optional[int],
+        job_display_name: Optional[str] = None,
 ) -> dict:
     """
     Запускає асинхронне Batch Prediction завдання у Vertex AI.
@@ -199,6 +211,7 @@ def extract_speaker_segments(diarization) -> list[tuple]:
     """
     Витягує (start, end, speaker) з об'єкту pyannote Annotation або DiarizeOutput.
     """
+
     def _from_annotation(obj):
         if hasattr(obj, "itertracks"):
             return [(t.start, t.end, spk) for t, _, spk in obj.itertracks(yield_label=True)]
@@ -253,9 +266,9 @@ def merge_whisper_and_diarization(whisper_segments: list, speaker_segments: list
 
 
 async def _run_pipeline(
-    tmp_path: str,
-    language: str,
-    num_speakers: Optional[int],
+        tmp_path: str,
+        language: str,
+        num_speakers: Optional[int],
 ) -> JSONResponse:
     """
     Повний онлайн-pipeline: діаризація → транскрипція → злиття.
@@ -316,22 +329,20 @@ async def _run_pipeline(
 
 
 # ──────────────────────────────────────────────
-# ENDPOINTS — ОНЛАЙН ОБРОБКА
+# ENDPOINTS — ГІБРИДНА ОБРОБКА
 # ──────────────────────────────────────────────
 
 @app.post("/predict")
 async def predict(
-    file: Optional[UploadFile] = File(None),
-    gcs_path: Optional[str] = Form(None),
-    language: str = Form("uk"),
-    num_speakers: Optional[int] = Form(None),
+        file: Optional[UploadFile] = File(None),
+        gcs_path: Optional[str] = Form(None),
+        language: str = Form("uk"),
+        num_speakers: Optional[int] = Form(None),
 ):
     """
-    Онлайн-обробка. Повертає результат синхронно (чекає завершення).
-
-    Варіанти:
-      multipart: file=<binary>, language="uk"
-      multipart: gcs_path="gs://bucket_audiov1/file.mp3", language="uk"
+    Розумний роутер:
+    - < 120 сек: Обробка онлайн (Cloud Run) за ~30 сек.
+    - >= 120 сек: Пакетна обробка (Vertex AI) за ~10-15 хв.
     """
     if not models["whisper"] or not models["pyannote"]:
         raise HTTPException(status_code=503, detail="AI моделі ще завантажуються.")
@@ -341,6 +352,7 @@ async def predict(
 
     tmp_path = None
     try:
+        # 1. Отримуємо файл у локальне сховище /tmp
         if gcs_path and gcs_path.startswith("gs://"):
             log("☁️", f"Режим GCS | URI: {gcs_path}")
             tmp_path = download_from_gcs(gcs_path)
@@ -351,14 +363,44 @@ async def predict(
                 f.write(await file.read())
             log("💾", f"Збережено: {tmp_path}")
 
-        return await _run_pipeline(tmp_path, language, num_speakers)
+        # 2. Перевіряємо тривалість
+        duration = get_audio_duration(tmp_path)
+
+        # 3. ВИБІР ШЛЯХУ (Гібридна логіка)
+        if duration < 120.0:  # Поріг 2 хвилини
+            log("🚀", "Короткий файл — запускаємо ОНЛАЙН обробку...")
+            return await _run_pipeline(tmp_path, language, num_speakers)
+        else:
+            log("🏭", "Довгий файл — перенаправляємо на BATCH обробку...")
+
+            # Якщо файл був завантажений через multipart (не GCS),
+            # його треба спочатку закинути в бакет, бо Batch працює тільки з GCS
+            final_gcs_uri = gcs_path
+            if not gcs_path:
+                client = storage.Client()
+                blob_name = f"uploads/auto_{uuid.uuid4().hex[:8]}_{file.filename}"
+                blob = client.bucket(GCS_BUCKET).blob(blob_name)
+                blob.upload_from_filename(tmp_path)
+                final_gcs_uri = f"gs://{GCS_BUCKET}/{blob_name}"
+
+            job_info = create_batch_prediction_job(
+                gcs_source_uri=final_gcs_uri,
+                language=language,
+                num_speakers=num_speakers
+            )
+            return JSONResponse(content={
+                "status": "accepted_batch",
+                "message": "Файл занадто великий для онлайн-обробки, запущено Batch Job",
+                "data": job_info
+            })
 
     except HTTPException:
         raise
     except Exception as e:
-        log("❌", f"Помилка під час обробки: {e}")
+        log("❌", f"Помилка роутингу або обробки: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        # Надійне очищення для всіх випадків (онлайн та батч)
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
         if device == "cuda":
@@ -368,10 +410,10 @@ async def predict(
 
 @app.post("/rawPredict")
 async def raw_predict(
-    file: Optional[UploadFile] = File(None),
-    gcs_path: Optional[str] = Form(None),
-    language: str = Form("uk"),
-    num_speakers: Optional[int] = Form(None),
+        file: Optional[UploadFile] = File(None),
+        gcs_path: Optional[str] = Form(None),
+        language: str = Form("uk"),
+        num_speakers: Optional[int] = Form(None),
 ):
     """
     Альтернативний endpoint — ідентична логіка /predict.
@@ -391,10 +433,10 @@ async def raw_predict(
 
 @app.post("/batchPredict")
 async def batch_predict(
-    gcs_path: str = Form(...),
-    language: str = Form("uk"),
-    num_speakers: Optional[int] = Form(None),
-    job_display_name: Optional[str] = Form(None),
+        gcs_path: str = Form(...),
+        language: str = Form("uk"),
+        num_speakers: Optional[int] = Form(None),
+        job_display_name: Optional[str] = Form(None),
 ):
     """
     Асинхронна batch-обробка через Vertex AI.
