@@ -1,6 +1,7 @@
 import os
 import gc
 import uuid
+import json
 import warnings
 import time
 import datetime
@@ -18,9 +19,12 @@ if not hasattr(np, "float"):
 import torch
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pyannote.audio import Pipeline
 from google.cloud import storage
 from google.cloud import aiplatform
+from google.auth.transport import requests as google_requests
+import google.auth
 import whisper
 import librosa
 import uvicorn
@@ -33,7 +37,7 @@ models = {"whisper": None, "pyannote": None}
 # Vertex AI — зчитуємо з env, щоб не хардкодити
 GCP_PROJECT_ID    = os.getenv("GCP_PROJECT_ID", "")
 GCP_LOCATION      = os.getenv("GCP_LOCATION", "us-central1")
-VERTEX_MODEL      = os.getenv("VERTEX_MODEL_RESOURCE_NAME", "")   # projects/.../models/...
+VERTEX_MODEL      = os.getenv("VERTEX_MODEL_RESOURCE_NAME", "")
 GCS_BUCKET        = os.getenv("GCS_BUCKET", "bucket_audiov1")
 GCS_OUTPUT_PREFIX = os.getenv("GCS_OUTPUT_PREFIX", "gs://bucket_audiov1/batch_results/")
 
@@ -82,7 +86,7 @@ async def lifespan(app: FastAPI):
         models["whisper"] = whisper.load_model("medium", device=device)
         log("✅", "Whisper готовий!")
 
-        log("🟢", "СЕРВЕР ГОТОВИЙ. Endpoints: /predict | /rawPredict | /batchPredict | /get-upload-url")
+        log("🟢", "СЕРВЕР ГОТОВИЙ. Endpoints: /predict | /rawPredict | /batchPredict | /get-upload-url | /getResult/{job_id}")
         yield
 
     except Exception as e:
@@ -97,6 +101,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AI Transcription Service v2", lifespan=lifespan)
+
+# --- CORS (для доступу з фронтенду) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ──────────────────────────────────────────────
@@ -116,9 +129,7 @@ def download_from_gcs(gcs_path: str) -> str:
         client = storage.Client()
         blob = client.bucket(bucket_name).blob(blob_name)
 
-        ext = os.path.splitext(blob_name)[-1] or ".tmp"
         local_path = f"/tmp/{uuid.uuid4()}_{blob_name.split('/')[-1]}"
-
         blob.download_to_filename(local_path)
         log("✅", f"GCS файл збережено: {local_path}")
         return local_path
@@ -140,12 +151,7 @@ def create_batch_prediction_job(
 ) -> dict:
     """
     Запускає асинхронне Batch Prediction завдання у Vertex AI.
-
-    Vertex AI сам заберає файл із GCS, обробить і покладе результат
-    у GCS_OUTPUT_PREFIX. Наш сервер при цьому не навантажується.
-
-    Повертає resource_name завдання — фронтенд може використати його
-    для опитування статусу через /batchStatus/{job_id}.
+    sync=False — сервер НЕ чекає завершення, одразу повертає job info.
     """
     if not GCP_PROJECT_ID or not VERTEX_MODEL:
         raise HTTPException(
@@ -167,10 +173,12 @@ def create_batch_prediction_job(
         job_display_name=display_name,
         model_name=VERTEX_MODEL,
         instances_format="jsonl",
+        predictions_format="jsonl",
         gcs_source=gcs_source_uri,
         gcs_destination_prefix=GCS_OUTPUT_PREFIX,
         model_parameters=model_parameters,
         machine_type="n1-standard-4",
+        sync=False,  # не блокуємо сервер — повертаємо одразу
     )
 
     log("✅", f"Batch Job створено: {batch_job.resource_name} | Стан: {batch_job.state.name}")
@@ -184,7 +192,7 @@ def create_batch_prediction_job(
 
 
 # ──────────────────────────────────────────────
-# ДОПОМІЖНІ ФУНКЦІЇ — PIPELINE (ОНЛАЙН)
+# ДОПОМІЖНІ ФУНКЦІЇ — ОНЛАЙН PIPELINE
 # ──────────────────────────────────────────────
 
 def extract_speaker_segments(diarization) -> list[tuple]:
@@ -251,7 +259,6 @@ async def _run_pipeline(
 ) -> JSONResponse:
     """
     Повний онлайн-pipeline: діаризація → транскрипція → злиття.
-    Викликається з /predict і /rawPredict.
     """
     start_time = time.time()
 
@@ -391,21 +398,8 @@ async def batch_predict(
 ):
     """
     Асинхронна batch-обробка через Vertex AI.
-
-    Файл має бути вже в GCS (gcs_path обов'язковий).
-    Сервер НЕ чекає результату — повертає resource_name завдання одразу.
-    Результат Vertex AI покладе сам у GCS_OUTPUT_PREFIX.
-
-    Приклад відповіді:
-    {
-      "status": "accepted",
-      "data": {
-        "job_resource_name": "projects/.../batchPredictionJobs/123",
-        "job_display_name": "transcription_batch_abc123",
-        "state": "JOB_STATE_QUEUED",
-        "output_prefix": "gs://bucket_audiov1/batch_results/"
-      }
-    }
+    Файл має бути вже в GCS. Сервер одразу повертає job info — не чекає.
+    Результат Vertex AI покладе у GCS_OUTPUT_PREFIX.
     """
     if not gcs_path.startswith("gs://"):
         raise HTTPException(
@@ -434,8 +428,7 @@ async def batch_predict(
 @app.get("/batchStatus/{job_id}")
 async def batch_status(job_id: str):
     """
-    Перевірка стану Batch Job за його числовим ID (останній сегмент resource_name).
-
+    Перевірка стану Batch Job за числовим ID.
     Приклад: GET /batchStatus/1234567890
     """
     if not GCP_PROJECT_ID:
@@ -445,7 +438,10 @@ async def batch_status(job_id: str):
 
     try:
         aiplatform.init(project=GCP_PROJECT_ID, location=GCP_LOCATION)
-        resource_name = f"projects/{GCP_PROJECT_ID}/locations/{GCP_LOCATION}/batchPredictionJobs/{job_id}"
+        resource_name = (
+            f"projects/{GCP_PROJECT_ID}/locations/{GCP_LOCATION}"
+            f"/batchPredictionJobs/{job_id}"
+        )
         job = aiplatform.BatchPredictionJob(resource_name)
 
         return JSONResponse(content={
@@ -465,43 +461,110 @@ async def batch_status(job_id: str):
 
 
 # ──────────────────────────────────────────────
+# ENDPOINT — ОТРИМАННЯ РЕЗУЛЬТАТУ З БАКЕТА
+# ──────────────────────────────────────────────
+
+@app.get("/getResult/{job_id}")
+async def get_result(job_id: str):
+    """
+    Забирає готовий результат із бакета Vertex AI.
+    Фронтенд викликає це коли /batchStatus повертає 'JOB_STATE_SUCCEEDED'.
+    """
+    if not GCP_PROJECT_ID:
+        raise HTTPException(status_code=503, detail="GCP_PROJECT_ID не налаштований.")
+
+    log("📥", f"Запит на отримання результату для Job ID: {job_id}")
+
+    try:
+        aiplatform.init(project=GCP_PROJECT_ID, location=GCP_LOCATION)
+        resource_name = (
+            f"projects/{GCP_PROJECT_ID}/locations/{GCP_LOCATION}"
+            f"/batchPredictionJobs/{job_id}"
+        )
+        job = aiplatform.BatchPredictionJob(resource_name)
+
+        if job.state.name != "JOB_STATE_SUCCEEDED":
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "not_ready",
+                    "detail": f"Завдання ще не завершено. Статус: {job.state.name}"
+                }
+            )
+
+        # Отримуємо директорію з результатом
+        gcs_output_dir = job.output_info.gcs_output_directory
+        log("📂", f"Результат у GCS: {gcs_output_dir}")
+
+        path_parts = gcs_output_dir.replace("gs://", "").split("/", 1)
+        bucket_name = path_parts[0]
+        prefix = path_parts[1] if len(path_parts) > 1 else ""
+
+        # Шукаємо .jsonl файл у папці результату
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blobs = list(bucket.list_blobs(prefix=prefix))
+
+        jsonl_blob = next((b for b in blobs if b.name.endswith(".jsonl")), None)
+
+        if not jsonl_blob:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "error", "detail": "Файл із результатом не знайдено в бакеті."}
+            )
+
+        # Читаємо і парсимо кожен рядок jsonl
+        content = jsonl_blob.download_as_text()
+        results = [
+            json.loads(line)
+            for line in content.strip().split("\n")
+            if line.strip()
+        ]
+
+        log("✅", f"Результат успішно зчитано ({len(results)} рядків).")
+        return JSONResponse(content={"status": "success", "data": results})
+
+    except Exception as e:
+        log("❌", f"Помилка отримання результату: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ──────────────────────────────────────────────
 # ENDPOINT — PRESIGNED URL ДЛЯ ПРЯМОГО UPLOAD
 # ──────────────────────────────────────────────
-from google.auth.transport import requests as google_requests
-import google.auth
 
 @app.post("/get-upload-url")
 async def get_upload_url(filename: str):
     """
-    Генерує тимчасовий підписаний URL (Signed URL v4) за допомогою IAM Credentials API.
+    Генерує тимчасовий Signed URL (v4, 15 хв) для прямого завантаження
+    файлу з браузера у GCS — без проходження через цей сервер.
+
+    Флоу на фронтенді:
+      1. POST /get-upload-url?filename=meeting.mp3
+         ← { upload_url, gcs_path, expires_in_minutes }
+      2. PUT upload_url  (тіло — бінарний файл, Content-Type: application/octet-stream)
+      3. POST /batchPredict  body: { gcs_path, language }
     """
     log("🔗", f"Генерація Signed URL для файлу: {filename}")
-
     try:
-        # 1. Отримуємо облікові дані Cloud Run
-        credentials, project = google.auth.default()
-
-        # 2. Якщо це дефолтні облікові дані Compute Engine (Cloud Run),
-        # нам потрібен email сервісного акаунта
+        credentials, _ = google.auth.default()
         auth_request = google_requests.Request()
         credentials.refresh(auth_request)
         service_account_email = credentials.service_account_email
 
         if not service_account_email:
-             raise ValueError("Не вдалося визначити Service Account Email")
+            raise ValueError("Не вдалося визначити Service Account Email")
 
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(GCS_BUCKET)
+        client = storage.Client()
         blob_name = f"uploads/{uuid.uuid4()}_{filename}"
-        blob = bucket.blob(blob_name)
+        blob = client.bucket(GCS_BUCKET).blob(blob_name)
 
-        # 3. Використовуємо IAM Credentials API для підпису
         url = blob.generate_signed_url(
             version="v4",
             expiration=datetime.timedelta(minutes=15),
             method="PUT",
             service_account_email=service_account_email,
-            access_token=credentials.token # Передаємо токен для автентифікації запиту на підпис
+            access_token=credentials.token,
         )
 
         gcs_path = f"gs://{GCS_BUCKET}/{blob_name}"
